@@ -147,3 +147,12 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Local per-account config (real character names) — never commit
+config.local.98.js
+config.local.*.js
+!config.local.example.98.js
+
+# Playground logs / screenshots
+*.log
+*.png
