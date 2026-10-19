@@ -92,18 +92,28 @@ below `CONFIG.tankCritHp` (30%), and **no new pulls happen while the tank is und
 range — with a `BAD{}` blacklist for level-locked skills, so the scripts degrade
 gracefully to plain `attack` / `heal` at low level.
 
-**Loot funnels to the merchant.** Fighters `send_item` everything to it and never
-leave the party (only emergency: merchant unseen *and* dry *and* inventory full).
+**Loot funnels to the merchant.** Fighters `send_item` everything to it — whole
+stacks, every tick, no cap — and never leave the party. Pot totals above
+`potionMax` flow back the same way, so a fighter carries exactly its cap.
 
-**Only the merchant sells and buys.** It sweeps the chest, sells loot, and keeps
-the party stocked from a **dynamic buffer starting at 500 potions** that grows
-from measured consumption. Delivery is **same-map only** — no cross-map walks, no
-paging, a 120 s gap between runs and a 15-minute backoff after repeated failures.
+**Only the merchant sells and buys.** Supply is **pull-based**: a fighter below
+`potionMin` (200) pages the merchant, which fills it to `potionMax` (1000) for
+just the stats flagged — same-map, no walking, no dumping. The merchant tops
+itself to `potionMaxMerchant` (4000) and vendors anything above that at the
+seller. A full bag and a low stock share **one town run**: travel once, sell
+everything, restock, come back.
+
+**Full bags beat pot hoarding.** A full unit sells its whole bag — all loot, plus
+pot stacks above its cap — at whatever NPC is in range; if pots are what's filling
+the bag they drop to the reserve floor (`supplyKeep`) so it can loot again.
+Fighters do this only when the merchant is **offline** (no heartbeat for
+`deliverEvery`); while she's merely away or dead they hold and wait for her. Gold
+loss on resale is accepted by design.
 
 **Teleport is restricted**: `town()` only fires on the main map; otherwise the
 merchant walks to the potions seller via the `"potions"` shortcut. Raw
 `find_npc` coordinates are never passed to `smart_move` — that's what causes the
-"Searching for path" infinite loop (an 8-second no-progress watchdog is also in
+"Searching for path" infinite loop (a 10-second no-progress watchdog is also in
 place).
 
 **Auto-recover**: characters respawn after the 10-second revive window, and fall
@@ -122,8 +132,28 @@ Set in `Common.99.js`, overridable in slot 98.
 | `tankCritHp` | `0.30` | tanks kite to backline below this |
 | `followDist` | `30` | hold distance to the ranger |
 | `kiteMax` | `600` | max kite radius from the ranger anchor |
-| `potionMin` | `20` | restock trip only when idle and below this |
+| `potionMin` | `200` | a fighter below this pulls from the merchant |
+| `potionMax` | `1000` | fighter cap per stat; excess funnels back to the merchant |
+| `potionMaxMerchant` | `4000` | merchant cap per stat; excess is vendored at the seller |
+| `supplyKeep` | `75` | merchant floor: never delivers below / emergency dump floor |
+| `goldReserve` | `2000` | gold never spent on potions |
 | `minMpReserve` | `100` | MP held back for heal/escape |
+
+### Unified timing
+
+Every throttle and backoff reads one block, so retries line up and units don't
+trickle to town one at a time.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `retryEvery` | `30000` | min gap between repeats of any throttled action |
+| `tripBackoff` | `180000` | failed/aborted town trip → wait before the next |
+| `tripBackoffHard` | `900000` | 3 consecutive failures → long cooldown |
+| `tripTimeout` | `90000` | hard cap on one town trip |
+| `legEvery` | `10000` | sell/buy/move leg cadence in town |
+| `stuckAfter` | `10000` | no-progress abort for movement |
+| `deliverEvery` | `60000` | delivery cooldown == request throttle == online window |
+| `supplyEvery` | `300000` | merchant restock cadence |
 
 ## Troubleshooting
 
@@ -137,9 +167,7 @@ Set in `Common.99.js`, overridable in slot 98.
 | `tank:<name>` / `heal:<name>` | current aggro target / heal target |
 | `mule` | merchant working around the party |
 | `wait party` | merchant's map differs from the ranger's |
-| `sell` | merchant is on a selling trip |
-| `pots` / `pots!` | merchant is resupplying (floor breach) |
-| `supply` | merchant is delivering potions |
+| `supply` | merchant is on its one town run (sell + restock) |
 
 **Skill errors / "skill not available"**
 
@@ -162,8 +190,8 @@ or a validated `{x, y, map}` — never `find_npc(...)` coordinates.
 
 **Merchant stuck in town**
 
-Check the overhead message above to see which branch it's in (`sell`, `pots`,
-`supply`, `mule`, `wait party`).
+Check the overhead message above to see which branch it's in (`supply`, `mule`,
+`wait party`).
 
 ## License
 

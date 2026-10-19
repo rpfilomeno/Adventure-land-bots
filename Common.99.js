@@ -17,8 +17,24 @@ var CONFIG = {
 	monsters: ["goo"],                 // generic farm target, override per run
 	followDist: 30,                    // hold distance to ranger
 	kiteMax: 600,                      // max kite radius from ranger anchor
-	potionMin: 20,                     // restock below this (fight first, trip only when idle)
 	minMpReserve: 100,                 // keep MP for heal/escape
+
+	// pot caps (per stat — hp and mp counted separately, across all stack tiers)
+	potionMin: 200,                    // fighter pulls from the merchant below this
+	potionMax: 1000,                   // fighter cap — excess funnels back to the merchant
+	potionMaxMerchant: 4000,           // merchant cap — excess is vendored at the seller
+	supplyKeep: 75,                    // merchant floor: never delivers below / emergency dump floor
+	goldReserve: 2000,                 // gold never spent on pots (travel/scrolls)
+
+	// unified timing — every throttle/backoff in the party reads these
+	retryEvery: 30000,                 // min gap between repeats of any throttled action
+	tripBackoff: 180000,               // failed/aborted town trip → wait before the next
+	tripBackoffHard: 900000,           // 3 consecutive failures → long cooldown
+	tripTimeout: 90000,                // hard cap on one town trip
+	legEvery: 10000,                   // sell/buy/move leg cadence in town
+	stuckAfter: 10000,                 // no-progress abort for movement
+	deliverEvery: 60000,               // delivery cooldown == request throttle == online window
+	supplyEvery: 300000,               // merchant restock cadence
 };
 
 // local overrides live in slot 98 (config.local.98.js, gitignored) so real
@@ -31,13 +47,21 @@ try {
 
 var RangerMsg = { target: null, x: 0, y: 0, map: "main" };
 var BAD = {}; // skills that don't exist / level-locked
+var muleSeenAt = Date.now(); // assume the mule is online at start: wait, don't vendor
 
 character.on("cm", function (m) {
+	if (m.message && typeof m.message == "object" && m.message.mule) { muleSeenAt = Date.now(); return; }
 	if (m.name == CONFIG.ranger && m.message && typeof m.message == "object") { RangerMsg = m.message; RangerMsg._t = Date.now(); }
 });
 
-// potion supply is merchant-scheduled (5-min interval + reserve floor) + passive
-// same-map delivery. fighters no longer page the merchant.
+// potion supply is pull-based: fighters page the merchant (cm request) below
+// potionMin and funnel any pots above potionMax back to it. the merchant
+// heartbeats, so "offline" (vendor it yourself) is distinct from "merely away or
+// dead" (hold and wait for her).
+function merchant_online() {
+	if (!CONFIG.merchant) return false;
+	return !!(get_player(CONFIG.merchant) || Date.now() - muleSeenAt < CONFIG.deliverEvery);
+}
 
 function can_use(name, target) {
 	if (BAD[name] || !G.skills[name]) return false;
@@ -132,7 +156,7 @@ function follow_ranger(ox, oy) {
 		if (!smart.moving) {
 			smart_move_safe({ x: RangerMsg.x, y: RangerMsg.y, map: RangerMsg.map }, 45000)
 				.then(function () { followFails = 0; })
-				.catch(function () { if (++followFails >= 3) { followHoldUntil = Date.now() + 60000; followFails = 0; } });
+				.catch(function () { if (++followFails >= 3) { followHoldUntil = Date.now() + CONFIG.retryEvery; followFails = 0; } });
 		}
 		return true;
 	}
@@ -158,7 +182,7 @@ function smart_move_safe(dest, timeoutMs) {
 				lastX = character.real_x; lastY = character.real_y; lastMove = Date.now(); return;
 			}
 			if (!lastMove) { lastMove = Date.now(); return; } // just began moving
-			if (Date.now() - lastMove > 8000) { stop("smart"); return done(reject, { reason: "path_lost" }); }
+			if (Date.now() - lastMove > CONFIG.stuckAfter) { stop("smart"); return done(reject, { reason: "path_lost" }); }
 		}
 		smart_move(dest).then(function () { done(resolve, { success: true }); })
 			.catch(function (e) { done(reject, e || { reason: "failed" }); });
@@ -211,6 +235,7 @@ function assist_target() {
 }
 
 var potionTrip = 0; // last potion-run timestamp (throttle)
+var potRequestAt = 0; // last pot request paged to the merchant (throttle)
 
 function free_slots() {
 	if (character.esize != null) return character.esize;
@@ -228,6 +253,37 @@ function junk_sig(it) {
 	return it.name + "@" + (it.level || 0);
 }
 
+// pot stacks of one stat (hp or mp), across tiers, ignoring locked/bound items.
+function potion_stacks(stat) {
+	return character.items.map(function (item, slot) { return { item: item, slot: slot }; })
+		.filter(function (e) { return e.item && !e.item.l && !e.item.b && !e.item.r &&
+			G.items[e.item.name] && G.items[e.item.name].type == "pot" &&
+			G.items[e.item.name].gives.some(function (g) { return g[0] == stat && g[1] > 0; }); });
+}
+
+function potion_count(stat) {
+	return potion_stacks(stat).reduce(function (s, e) { return s + (e.item.q || 1); }, 0);
+}
+
+// sell pot stacks down to `cap` (default: this character's own cap). whole stacks
+// from the back — a partial stack keeps its slot, so selling out is what actually
+// frees space. onFail reports a rejected sale (no NPC in range).
+function sell_excess_pots(cap, onFail) {
+	var c = cap || (character.name == CONFIG.merchant ? CONFIG.potionMaxMerchant : CONFIG.potionMax);
+	var fail = function () { if (onFail) onFail(); };
+	for (var s = 0; s < 2; s++) {
+		var stat = s ? "mp" : "hp", list = potion_stacks(stat), total = 0;
+		for (var i = 0; i < list.length; i++) total += list[i].item.q || 1;
+		for (var j = list.length - 1; j >= 0 && total > c; j--) {
+			var q = list[j].item.q || 1;
+			if (total - q >= c) { sell(list[j].slot, q).then(function (r) { if (r && r.failed) fail(); }).catch(fail); total -= q; }
+			else { sell(list[j].slot, total - c).then(function (r) { if (r && r.failed) fail(); }).catch(fail); total = c; }
+		}
+	}
+}
+
+// pots are kept here: the full-bag path sells the *excess* via sell_excess_pots,
+// so a unit under its cap never vendors pots it needs. xptoken always protected.
 function cheapest_junk() {
 	var keep = { hpot0: 1, hpot1: 1, mpot0: 1, mpot1: 1, xptoken: 1 };
 	var worst = -1, worstVal = Infinity;
@@ -240,24 +296,39 @@ function cheapest_junk() {
 	return worst;
 }
 
-// when inventory is full: sell cheapest junk to a nearby NPC (full stack, to free the slot).
-// never blocks combat; sets sellFailed so town_sell_tick knows a town trip is needed.
-function tidy_inventory() {
-	if (free_slots() > 1) { sellFailed = false; return; }
-	// merchant in sight → funnel drains the bags, don't vendor what it will collect
-	if (character.name != CONFIG.merchant && get_player(CONFIG.merchant)) return;
-	var w = cheapest_junk();
-	if (w < 0) return;
-	var q = (character.items[w] && character.items[w].q) || 1;
-	sell(w, q).then(function (r) { if (r && r.failed) sellFailed = true; }).catch(function () { sellFailed = true; });
+var lastBagSell = 0; // full_bag_sell throttle — a bag that stays full can't burst sells
+
+// full bag: sell the whole thing — all loot plus pot stacks above the cap — so
+// loot slots win over pot hoarding (gold loss accepted). if pots are what's
+// filling the bag, drop them to the reserve floor so the unit can loot again.
+// throttled: off-NPC the sells reject, and we must not fire a burst every tick.
+function full_bag_sell() {
+	if (Date.now() - lastBagSell < CONFIG.legEvery) return;
+	lastBagSell = Date.now();
+	var failed = function () { sellFailed = true; };
+	sell_all_junk(failed);
+	sell_excess_pots(undefined, failed);
+	// only when pots are what's filling the bag — with sellable loot present the
+	// junk sales above free the slots, so the pot cap is left intact.
+	if (free_slots() <= 1 && cheapest_junk() < 0) sell_excess_pots(CONFIG.supplyKeep, failed);
 }
 
-function sell_all_junk() {
+// when inventory is full: dump the bag. the mule always does it herself; fighters
+// only when the mule is genuinely offline — while she's online (in sight, or just
+// away/dead) they hold, because the funnel will drain them.
+function tidy_inventory() {
+	if (free_slots() > 1) { sellFailed = false; return; }
+	if (character.name != CONFIG.merchant && merchant_online()) return;
+	full_bag_sell();
+}
+
+function sell_all_junk(onFail) {
 	var keep = { hpot0: 1, hpot1: 1, mpot0: 1, mpot1: 1, xptoken: 1 };
+	var fail = function () { if (onFail) onFail(); };
 	for (var i = 0; i < character.items.length; i++) {
 		var it = character.items[i];
 		if (!it || keep[it.name] || skipSell[junk_sig(it)]) continue;
-		sell(i, it.q || 1).catch(function () {});
+		sell(i, it.q || 1).then(function (r) { if (r && r.failed) fail(); }).catch(fail);
 	}
 }
 
@@ -267,9 +338,9 @@ function sell_all_junk() {
 // find_npc raw coords. returns true while the trip is busy (skip combat that tick).
 function town_sell_tick() {
 	if (townTrip) {
-		if (Date.now() - townTrip.started > 90000) { // watchdog: abort, rejoin party, retry later
+		if (Date.now() - townTrip.started > CONFIG.tripTimeout) { // watchdog: abort, rejoin party, retry later
 			townTrip = null; sellFailed = false;
-			townCooldownUntil = Date.now() + 3 * 60 * 1000;
+			townCooldownUntil = Date.now() + CONFIG.tripBackoff;
 			stop("smart"); return true;
 		}
 		if (is_transporting(character)) return true;
@@ -277,7 +348,7 @@ function town_sell_tick() {
 			if (!townTrip.progPos) townTrip.progPos = { x: character.x, y: character.y, t: Date.now() };
 			else if (Math.hypot(character.x - townTrip.progPos.x, character.y - townTrip.progPos.y) >= 5)
 				townTrip.progPos = { x: character.x, y: character.y, t: Date.now() };
-			else if (Date.now() - townTrip.progPos.t > 12000) { stop("smart"); townTrip.progPos = null; }
+			else if (Date.now() - townTrip.progPos.t > CONFIG.stuckAfter) { stop("smart"); townTrip.progPos = null; }
 			return true;
 		}
 		townTrip.progPos = null;
@@ -288,7 +359,7 @@ function town_sell_tick() {
 			if (b && b.map != character.map && character.name == CONFIG.ranger) smart_move_safe(b, 45000).catch(function () {});
 			return true;
 		}
-		if (Date.now() - (townTrip.legAt || 0) > 10000) {
+		if (Date.now() - (townTrip.legAt || 0) > CONFIG.legEvery) {
 			townTrip.legAt = Date.now();
 			// teleport only when on the main map (clean spawn, clears wedges).
 			// off-main we walk to this map's nearest potions seller instead.
@@ -306,7 +377,7 @@ function town_sell_tick() {
 				var q = cheapest_junk();
 				if (q >= 0 && character.items[q]) skipSell[junk_sig(character.items[q])] = 1;
 				townTrip = null; sellFailed = false;
-				townCooldownUntil = Date.now() + 3 * 60 * 1000;
+				townCooldownUntil = Date.now() + CONFIG.tripBackoff;
 				stop("smart");
 				return true;
 			}
@@ -317,8 +388,8 @@ function town_sell_tick() {
 	}
 	if (free_slots() <= 1 && sellFailed && cheapest_junk() >= 0 && Date.now() > townCooldownUntil) {
 		// tank discipline: selling is the mule's job — fighters funnel to it and hold.
-		// only trip if abandoned (mule unseen).
-		if (character.name != CONFIG.merchant && get_player(CONFIG.merchant)) return false;
+		// only trip when she is genuinely offline (away or dead → hold and wait).
+		if (character.name != CONFIG.merchant && merchant_online()) return false;
 		townTrip = { back: { x: character.x, y: character.y, map: character.map }, started: Date.now(), legAt: 0, progPos: null, lastFree: -1, deadLegs: 0, ported: false };
 		return true; // first leg teleports (main) or walks to the local seller
 	}
@@ -326,18 +397,49 @@ function town_sell_tick() {
 }
 
 // everyone loots, fighters funnel all loot to the merchant (who sells it in town).
-// 2 slots per tick to avoid socket spam; merchant itself skips (it IS the mule).
+// pass 1 sends every loot stack (no cap — loot must never be held back), pass 2
+// sends pot totals above CONFIG.potionMax. a rejected send (mule full) is logged
+// and does not count as progress. merchant itself skips (it IS the mule).
+var funnelLogAt = 0;
+function funnel_rejected(reason) {
+	if (Date.now() - funnelLogAt < CONFIG.retryEvery) return; // throttle the log, not the send
+	funnelLogAt = Date.now();
+	log("funnel rejected: " + reason);
+}
+
 function funnel_to_merchant() {
 	if (character.name == CONFIG.merchant || !CONFIG.merchant) return false;
 	var m = get_player(CONFIG.merchant);
 	if (!m || m.rip) return false;
-	var keep = { hpot0: 1, hpot1: 1, mpot0: 1, mpot1: 1, xptoken: 1 };
+	var tot = { hp: 0, mp: 0 }, i;
+	for (i = 0; i < character.items.length; i++) {
+		var p = character.items[i];
+		if (!p) continue;
+		if (p.name == "hpot0" || p.name == "hpot1") tot.hp += p.q || 1;
+		else if (p.name == "mpot0" || p.name == "mpot1") tot.mp += p.q || 1;
+	}
+	var overHp = Math.max(0, tot.hp - CONFIG.potionMax), overMp = Math.max(0, tot.mp - CONFIG.potionMax);
 	var sent = 0;
-	for (var i = 0; i < character.items.length && sent < 2; i++) {
-		var it = character.items[i];
-		if (!it || keep[it.name]) continue;
-		send_item(CONFIG.merchant, i, it.q || 1).catch(function () {});
+	var send = function (slot, q) {
 		sent++;
+		send_item(CONFIG.merchant, slot, q).then(function (r) {
+			if (r && r.failed) funnel_rejected(r.reason || "full?");
+		}).catch(function () { funnel_rejected("send failed"); });
+	};
+	for (i = 0; i < character.items.length; i++) { // pass 1: every loot stack
+		var it = character.items[i];
+		if (!it || it.name == "xptoken") continue;
+		if (it.name == "hpot0" || it.name == "hpot1" || it.name == "mpot0" || it.name == "mpot1") continue;
+		send(i, it.q || 1);
+	}
+	for (i = 0; i < character.items.length; i++) { // pass 2: pot excess over the cap
+		var pt = character.items[i];
+		if (!pt) continue;
+		var q = pt.q || 1, give = 0;
+		if (pt.name == "hpot0" || pt.name == "hpot1") { give = Math.min(q, overHp); overHp -= give; }
+		else if (pt.name == "mpot0" || pt.name == "mpot1") { give = Math.min(q, overMp); overMp -= give; }
+		else continue;
+		if (give > 0) send(i, give);
 	}
 	return sent > 0;
 }
@@ -368,9 +470,18 @@ function sustain(hasTarget) {
 	// run (never merely low). abandoned + bone-dry may still trip, idle moment only.
 	var qh = quantity("hpot0") + quantity("hpot1"), qm = quantity("mpot0") + quantity("mpot1");
 	var low = qh < CONFIG.potionMin || qm < CONFIG.potionMin;
+	// pull supply: page the merchant when low — she fills same-map, on request,
+	// only the stats flagged. re-ask once per delivery cycle until stocked.
+	if (low && character.name != CONFIG.merchant && merchant_online() &&
+		Date.now() - potRequestAt > CONFIG.deliverEvery) {
+		potRequestAt = Date.now();
+		send_cm(CONFIG.merchant, { t: "pots", hp: qh, mp: qm }).catch(function () {});
+	}
+	// self-rescue only: both stats dry AND the mule not in sight (she may be away
+	// or dead — a dry fighter can't afford to wait). the merchant always may trip.
 	var mayTrip = character.name == CONFIG.merchant ||
 		(qh == 0 && qm == 0 && !get_player(CONFIG.merchant));
-	if (low && mayTrip && (!hasTarget || smart.moving) && Date.now() - potionTrip > 30000) {
+	if (low && mayTrip && (!hasTarget || smart.moving) && Date.now() - potionTrip > CONFIG.retryEvery) {
 		potionTrip = Date.now();
 		if (!smart.moving) {
 			// "potions" shortcut (validated per-map coords — never find_npc raw
@@ -380,8 +491,13 @@ function sustain(hasTarget) {
 			(character.map == "main" ? town().catch(function () {}) : Promise.resolve())
 				.then(function () { return smart_move_safe("potions", 45000); })
 				.then(function () {
-					buy("hpot1", 200).catch(function () {});
-					buy("mpot1", 200).catch(function () {});
+					// buy up to the fighter cap (both stats), as gold allows
+					var hg = (G.items.hpot1 && G.items.hpot1.g) || 100, mg = (G.items.mpot1 && G.items.mpot1.g) || 100;
+					var aff = Math.max(0, character.gold - CONFIG.goldReserve);
+					var nH = Math.min(Math.max(0, CONFIG.potionMax - qh), Math.floor(aff / hg));
+					var nM = Math.min(Math.max(0, CONFIG.potionMax - qm), Math.floor(Math.max(0, aff - nH * hg) / mg));
+					if (nH > 0) buy("hpot1", nH).catch(function () {});
+					if (nM > 0) buy("mpot1", nM).catch(function () {});
 				})
 				.catch(function () {});
 		}

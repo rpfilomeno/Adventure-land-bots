@@ -1,29 +1,15 @@
 // Merchant.7.js — party mule: loots, funnels, sells, supplies. Slot 7.
-// Never stands — town only for sale/potion errands (teleport-first), otherwise
-// glued to the party. Loot is vendor-sold via sell_all_junk (no player stand).
+// Never stands — town only for ONE combined run (sell the bag + restock),
+// teleport-first, otherwise glued to the party. Loot is vendor-sold at the
+// seller (no player stand). Caps and timings live in CONFIG (Common.99.js).
 load_code(99);
 var lastPos = null, lastMoveT = 0;
 var LOOT_SWEEP = 500; // chase chests within this range of self
 var LOOT_REACH = 80;  // walk until this close, loot() fires each tick anyway
-CONFIG.supplyEvery = 5 * 60 * 1000; // restock interval (kept)
-CONFIG.supplyTopBase = 500;  // initial stock target (adapts to party consumption)
-CONFIG.supplyTopMin = 500;   // never buffer less
-CONFIG.supplyTopMax = 5000;  // cap
-CONFIG.supplyCover = 2;      // buffer = 2 intervals of measured consumption
-CONFIG.supplyTop = CONFIG.supplyTopBase;
-CONFIG.supplyKeep = 75;      // reserve floor she never delivers below
-CONFIG.deliverAmount = 50;   // pots handed per member per delivery
-var delivered = 0, consumption = 0, lastCalc = Date.now(); // consumption tracking
-var supplyRun = false, supplySince = 0, lastSupply = Date.now();
-var supplyFails = 0, supplyCooldownUntil = 0; // 3 straight failures → 15-min backoff
-var potRetryUntil = 0; // failed buys back off: rejoin party, retry later
-var potPorted = false, potLegs = 0, potShopAt = 0; // per-episode warp + bounded legs
 
-// town task over (or retry pending) → stop shop plots, walk straight back.
-function return_to_party() {
-	stop("smart");
-	follow_ranger(-25, -10);
-}
+var runActive = false, runSince = 0, lastRun = Date.now(); // the one town run
+var runFails = 0, runCooldownUntil = 0; // 3 straight failures → tripBackoffHard
+var lastMuleCm = 0; // heartbeat throttle
 
 // nearest unlooted chest with coordinates, within maxDist of self
 function nearest_chest(maxDist) {
@@ -42,21 +28,10 @@ function nearest_chest(maxDist) {
 function unstuck() {
 	var dx = lastPos ? Math.hypot(character.x - lastPos.x, character.y - lastPos.y) : 999;
 	if (dx >= 5) { lastPos = { x: character.x, y: character.y }; lastMoveT = Date.now(); }
-	else if (smart.moving && Date.now() - lastMoveT > 12000) stop("smart");
+	else if (smart.moving && Date.now() - lastMoveT > CONFIG.stuckAfter) stop("smart");
 }
 
-function potion_stacks(stat) {
-	return character.items.map(function (item, slot) { return { item: item, slot: slot }; })
-		.filter(function (e) { return e.item && !e.item.l && !e.item.b && !e.item.r &&
-			G.items[e.item.name] && G.items[e.item.name].type == "pot" &&
-			G.items[e.item.name].gives.some(function (g) { return g[0] == stat && g[1] > 0; }); });
-}
-
-function potion_count(stat) {
-	return potion_stacks(stat).reduce(function (s, e) { return s + (e.item.q || 1); }, 0);
-}
-
-// 20s timeout race: a never-settling move rejects instead of wedging the run.
+// timeout race: a never-settling move rejects instead of wedging the run.
 function with_timeout(promise, ms) {
 	return Promise.race([promise, new Promise(function (_, rej) {
 		setTimeout(function () { rej({ reason: "timeout" }); }, ms);
@@ -69,77 +44,94 @@ async function attempt(promise, ms, reason) {
 	catch (e) { return (e && e.reason) || reason; }
 }
 
-// stock potions at the nearest seller ("potions" shortcut). NO delivery here —
-// delivery is passive (deliver_nearby) and same-map only, so there is no
-// cross-map recipient walk to loop on. returns ok:false only on a real failure
-// (gold / shop unreachable) so the 3-fail → 15-min backoff can engage.
-async function supply_friend() {
-	var hp = Math.max(0, CONFIG.supplyTop - potion_count("hp"));
-	var mp = Math.max(0, CONFIG.supplyTop - potion_count("mp"));
-	if (hp <= 0 && mp <= 0) return { ok: true, stocked: true }; // already stocked
-	var hpg = (G.items.hpot0 && G.items.hpot0.g) || 0, mpg = (G.items.mpot0 && G.items.mpot0.g) || 0;
-	var hpN = hp, mpN = mp;
-	if (hpg > 0 && mpg > 0) { // affordability: HP first, MP with remainder, keep 4000
-		var gold = character.gold - 4000;
-		hpN = gold > 0 ? Math.min(hp, Math.floor(gold / hpg)) : 0;
-		mpN = gold > 0 ? Math.min(mp, Math.floor(Math.max(0, gold - hpN * hpg) / mpg)) : 0;
-		if (hpN <= 0 && mpN <= 0) return { ok: false, reason: "gold" };
+// heartbeat: lets fighters tell "mule offline" (vendor it yourself) from "mule
+// merely away or dead" (hold and wait for her).
+function mule_heartbeat() {
+	if (Date.now() - lastMuleCm < 5000) return;
+	lastMuleCm = Date.now();
+	send_cm(CONFIG.party, { mule: 1 }).catch(function () {});
+}
+
+// biggest pot stack of a stat — delivery must not be capped by a tiny first stack.
+function best_pot_stack(stat) {
+	var list = potion_stacks(stat), best = null;
+	for (var i = 0; i < list.length; i++) {
+		if (!best || (list[i].item.q || 1) > (best.item.q || 1)) best = list[i];
 	}
+	return best;
+}
+
+// pull delivery: fill pot requests fighters page in (cm {t:"pots"}), same map, no
+// walking. only the stats the fighter flagged low are handed, filled to its cap.
+// the cooldown is stamped on every attempt, even a failed one, so a pending
+// request retries once per delivery cycle instead of once per tick.
+var lastDeliver = {}, potRequests = {};
+character.on("cm", function (m) {
+	if (!m.message || typeof m.message != "object" || m.message.t != "pots") return;
+	if (m.name == character.name || CONFIG.party.indexOf(m.name) < 0) return;
+	potRequests[m.name] = { hp: m.message.hp || 0, mp: m.message.mp || 0, at: Date.now() };
+});
+
+function deliver_requested() {
+	var sent = 0;
+	for (var i = 0; i < CONFIG.party.length; i++) {
+		var n = CONFIG.party[i];
+		if (n == character.name) continue;
+		var r = potRequests[n];
+		if (!r) continue;
+		if (Date.now() - r.at > CONFIG.deliverEvery * 2) { delete potRequests[n]; continue; } // stale
+		var f = get_player(n);
+		if (!f || f.rip || f.map != character.map) continue; // wait until same map
+		if (Date.now() - (lastDeliver[n] || 0) < CONFIG.deliverEvery) continue;
+		lastDeliver[n] = Date.now(); // stamped even if nothing can be sent (retry cadence)
+		var pending = false;
+		for (var s = 0; s < 2; s++) {
+			var stat = s ? "mp" : "hp";
+			var have = s ? r.mp : r.hp;
+			if (have >= CONFIG.potionMin) continue; // this stat wasn't flagged low
+			var entry = best_pot_stack(stat);
+			if (!entry) { pending = true; continue; } // nothing in stock — keep the request
+			var amount = Math.min(CONFIG.potionMax - have, entry.item.q || 1, potion_count(stat) - CONFIG.supplyKeep);
+			if (amount <= 0) { pending = true; continue; } // below the reserve floor — keep it
+			send_item(n, entry.slot, amount).catch(function () {});
+			sent++;
+			if (s) r.mp = CONFIG.potionMax; else r.hp = CONFIG.potionMax; // this stat is filled
+		}
+		if (!pending) delete potRequests[n]; // every flagged stat got its delivery
+	}
+	return sent;
+}
+
+// ONE town run: travel to the seller, sell the whole bag + pot excess, then top
+// the stock up to the cap. both triggers (full bag, low stock) share this trip,
+// so a bag that fills mid-restock rides along instead of causing a second visit.
+async function town_run() {
 	stop("smart");
-	// "potions" shortcut = validated per-map shop coords (main 56,-122;
-	// winter_inn/halloween elsewhere). never find_npc raw coords — those trigger
-	// the engine's infinite "Searching for path" restart loop. teleport only on main.
 	if (character.map == "main") {
 		var terr = await attempt(town(), 30000, "town");
 		if (terr) return { ok: false, reason: terr };
 	}
 	if (character.rip) return { ok: false, reason: "rip" };
-	try { await smart_move_safe("potions", 45000); }
+	try { await smart_move_safe("potions", CONFIG.tripTimeout); }
 	catch (e) { return { ok: false, reason: (e && e.reason) || "move_shop" }; }
-	sell_all_junk(); // at the seller anyway → sell loot too (frees slots + gold)
+	sell_all_junk();
+	sell_excess_pots();
+	if (free_slots() <= 1) sell_excess_pots(CONFIG.supplyKeep); // still full → emergency floor
 	if (typeof sleep == "function") await sleep(1500); // let sells land before buying
+	// buy AFTER the sells — they just changed the counts (the old code bought the
+	// pre-trip amount and never landed on the target)
+	var hpN = Math.max(0, CONFIG.potionMaxMerchant - potion_count("hp"));
+	var mpN = Math.max(0, CONFIG.potionMaxMerchant - potion_count("mp"));
+	var hpg = (G.items.hpot0 && G.items.hpot0.g) || 0, mpg = (G.items.mpot0 && G.items.mpot0.g) || 0;
+	if (hpg > 0 && mpg > 0) { // affordability: HP first, MP with the remainder, keep goldReserve
+		var gold = character.gold - CONFIG.goldReserve;
+		hpN = gold > 0 ? Math.min(hpN, Math.floor(gold / hpg)) : 0;
+		mpN = gold > 0 ? Math.min(mpN, Math.floor(Math.max(0, gold - hpN * hpg) / mpg)) : 0;
+		if (hpN <= 0 && mpN <= 0) return { ok: false, reason: "gold" };
+	}
 	if (hpN > 0) { try { await buy_with_gold("hpot0", hpN); } catch (e) {} }
 	if (mpN > 0) { try { await buy_with_gold("mpot0", mpN); } catch (e) {} }
 	return { ok: true, bought: hpN + mpN };
-}
-
-// passive top-up: hand pots to nearby party members on the SAME map (no walking).
-// per-member cooldown bounds sends; amounts are counted into `delivered` so the
-// stock target can track how fast the party actually burns potions.
-var lastDeliver = {};
-function deliver_nearby() {
-	var sent = 0;
-	for (var i = 0; i < CONFIG.party.length && sent < 2; i++) {
-		var n = CONFIG.party[i];
-		if (n == character.name) continue;
-		var f = get_player(n);
-		if (!f || f.rip || f.map != character.map || distance(character, f) > 200) continue;
-		if (Date.now() - (lastDeliver[n] || 0) < 90000) continue; // 90s per member
-		var any = false;
-		for (var s = 0; s < 2 && sent < 2; s++) {
-			var stat = s ? "mp" : "hp";
-			var entry = potion_stacks(stat)[0];
-			if (!entry) continue;
-			var amount = Math.min(CONFIG.deliverAmount, entry.item.q || 1, potion_count(stat) - CONFIG.supplyKeep);
-			if (amount <= 0) continue;
-			send_item(n, entry.slot, amount).catch(function () {});
-			delivered += amount; // feeds consumption tracking
-			sent++; any = true;
-		}
-		if (any) lastDeliver[n] = Date.now();
-	}
-	return sent;
-}
-
-// buffer adapts to measured consumption: what she handed out over the last
-// interval ≈ what the party burned. EWMA smooths it; clamped to [min, max].
-function update_stock_target() {
-	consumption = consumption ? consumption * 0.5 + delivered * 0.5 : delivered;
-	CONFIG.supplyTop = Math.min(CONFIG.supplyTopMax, Math.max(CONFIG.supplyTopMin, Math.round(consumption * CONFIG.supplyCover)));
-	CONFIG.supplyKeep = Math.max(75, Math.round(CONFIG.supplyTop * 0.15));
-	CONFIG.deliverAmount = Math.max(50, Math.round(CONFIG.supplyTop * 0.1));
-	delivered = 0;
-	lastCalc = Date.now();
 }
 
 setInterval(function () {
@@ -147,69 +139,37 @@ setInterval(function () {
 	use_hp_or_mp();
 	regen_check(); // dry → regen (shared cooldown keeps pots first)
 	for (var id in get_chests()) loot(id);
-	tidy_inventory(); // sell junk nearby, or flag a town sale trip when full
-	var dry = quantity("hpot0") + quantity("hpot1") == 0 && quantity("mpot0") + quantity("mpot1") == 0; // no pots at all
-	deliver_nearby(); // passive same-map top-up (no walking; feeds consumption tracking)
-	if (town_sell_tick()) { unstuck(); set_message("sell"); return; } // full → seller trip
-	if (supplyRun) { // stock run in progress — async fn drives movement, don't fight it
-		if (Date.now() - supplySince > 180000) { supplyRun = false; stop("smart"); } // watchdog
+	tidy_inventory(); // full → dump the bag (throttled; the mule always sells her own)
+	mule_heartbeat();
+	deliver_requested(); // fill paged pot requests (no walking)
+	if (runActive) { // town run in progress — the async fn drives movement, don't fight it
+		if (Date.now() - runSince > CONFIG.tripTimeout) { runActive = false; stop("smart"); } // watchdog
 		else { unstuck(); set_message("supply"); return; }
 	}
-	// adapt the stock target to measured consumption once per interval.
-	if (Date.now() - lastCalc > CONFIG.supplyEvery) update_stock_target();
-	// trip to restock on the 5-min schedule (when below target) OR when down to the
-	// reserve floor. no page can force an off-schedule trip (walk-back time is safe).
+	// ONE trip for both jobs: the bag stuck full (no NPC in reach), or the stock
+	// below cap on its cadence — the supplyKeep floor is the emergency case.
+	var sinceRun = Date.now() - lastRun;
 	var hpN = potion_count("hp"), mpN = potion_count("mp");
-	var needStock = hpN < CONFIG.supplyTop || mpN < CONFIG.supplyTop;
+	var full = free_slots() <= 1 && sellFailed;
+	var needStock = hpN < CONFIG.potionMaxMerchant || mpN < CONFIG.potionMaxMerchant;
 	var emergency = hpN < CONFIG.supplyKeep || mpN < CONFIG.supplyKeep;
-	if (needStock && !townTrip && !in_instance(character.map) && free_slots() > 1 &&
-		Date.now() > supplyCooldownUntil && Date.now() - lastSupply > 120000 && // min gap between runs
-		(Date.now() - lastSupply > CONFIG.supplyEvery || emergency)) {
+	var want = full || (needStock && (emergency ? sinceRun > CONFIG.retryEvery : sinceRun > CONFIG.supplyEvery));
+	if (want && sinceRun > CONFIG.retryEvery && !in_instance(character.map) && Date.now() > runCooldownUntil) {
 		stop("smart");
-		supplyRun = true; supplySince = Date.now();
-		supply_friend().then(function (r) {
-			log("supply: " + JSON.stringify(r));
-			if (r && r.ok) supplyFails = 0;
+		runActive = true; runSince = Date.now();
+		town_run().then(function (r) {
+			log("town: " + JSON.stringify(r));
+			if (r && r.ok) runFails = 0;
 			else { // failed run: count, back off hard after 3 straight — ends the town yo-yo
-				supplyFails++;
-				if (supplyFails >= 3) { supplyCooldownUntil = Date.now() + 15 * 60 * 1000; log("supply backing off 15m"); }
+				runFails++;
+				runCooldownUntil = Date.now() + (runFails >= 3 ? CONFIG.tripBackoffHard : CONFIG.tripBackoff);
+				if (runFails >= 3) log("town backing off (hard)");
 			}
-		}).catch(function () { log("supply failed"); supplyFails++; })
-			.then(function () { supplyRun = false; lastSupply = Date.now(); });
+		}).catch(function () {
+			runFails++;
+			runCooldownUntil = Date.now() + (runFails >= 3 ? CONFIG.tripBackoffHard : CONFIG.tripBackoff);
+		}).then(function () { runActive = false; lastRun = Date.now(); });
 		set_message("supply"); return;
-	}
-	// dry off-main → walk to this map's nearest potions seller (no forced town)
-	if (dry && character.map != "main") {
-		if (!smart.moving) smart_move_safe("potions", 45000).catch(function () {});
-		unstuck(); set_message("pots!"); return;
-	}
-	// self resupply (any map): teleport only on main, else walk to the local seller.
-	// still low after 3 legs → back off 3 min and rejoin the party immediately.
-	var lowPots = quantity("hpot0") + quantity("hpot1") < CONFIG.potionMin ||
-		quantity("mpot0") + quantity("mpot1") < CONFIG.potionMin;
-	if (!lowPots) potPorted = false;
-	if (lowPots) {
-		if (Date.now() < potRetryUntil) { return_to_party(); unstuck(); set_message("pots"); return; }
-		if (!potPorted) {
-			potPorted = true; potLegs = 0; potShopAt = 0;
-			// teleport only when on main; off-main fall through to the local-seller walk
-			if (character.map == "main" && !is_transporting(character)) { stop("smart"); town().catch(function () {}); }
-			unstuck(); set_message("pots"); return;
-		}
-		if (Date.now() - potShopAt > 10000) {
-			potShopAt = Date.now();
-			sell_all_junk(); // at the seller → dump loot while buying pots
-			// affordability: top up what the gold covers (keep 2000), skip when broke
-			var hg = (G.items.hpot1 && G.items.hpot1.g) || 100, mg = (G.items.mpot1 && G.items.mpot1.g) || 100;
-			var aff = Math.max(0, character.gold - 2000);
-			var nH = Math.min(200, Math.floor(aff / hg)), nM = Math.min(200, Math.floor(Math.max(0, aff - nH * hg) / mg));
-			if (nH > 0) buy("hpot1", nH).catch(function () {});
-			if (nM > 0) buy("mpot1", nM).catch(function () {});
-			if (nH <= 0 && nM <= 0) { potRetryUntil = Date.now() + 3 * 60 * 1000; potPorted = false; }
-			else if (!smart.moving) smart_move_safe("potions", 45000).catch(function () {});
-			if (++potLegs >= 3) { potRetryUntil = Date.now() + 3 * 60 * 1000; potPorted = false; }
-		}
-		unstuck(); set_message("pots"); return; // keep resupplying until stocked / potLegs cap
 	}
 	var m = RangerMsg.target ? get_monster(RangerMsg.target) : null;
 	if (m && aggro_lost(m)) kite_step(m, CONFIG.tank); // targeted → safety first, no looting

@@ -21,5 +21,21 @@ CONFIG.party = ["YourRangerName", "YourTankName",
 // CONFIG.tankCritHp = 0.30;
 // CONFIG.followDist = 30;
 // CONFIG.kiteMax = 600;
-// CONFIG.potionMin = 20;
 // CONFIG.minMpReserve = 100;
+
+// pot caps (per stat — hp and mp counted separately)
+// CONFIG.potionMin = 200;            // fighter pulls from the merchant below this
+// CONFIG.potionMax = 1000;           // fighter cap; excess funnels back
+// CONFIG.potionMaxMerchant = 4000;   // merchant cap; excess is vendored
+// CONFIG.supplyKeep = 75;            // merchant floor / emergency dump floor
+// CONFIG.goldReserve = 2000;         // gold never spent on potions
+
+// unified timing (every throttle/backoff in the party)
+// CONFIG.retryEvery = 30000;
+// CONFIG.tripBackoff = 180000;
+// CONFIG.tripBackoffHard = 900000;
+// CONFIG.tripTimeout = 90000;
+// CONFIG.legEvery = 10000;
+// CONFIG.stuckAfter = 10000;
+// CONFIG.deliverEvery = 60000;
+// CONFIG.supplyEvery = 300000;
